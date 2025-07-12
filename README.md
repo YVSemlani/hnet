@@ -1,4 +1,7 @@
-# H-Net
+# Analyzing H-Net + Dynamic Chunking
+
+I'm analyzing the H-Net architecture and writing a dynamic chunking kernel. Here's what I'm doing or have done:
+- Investigated number of boundary tokens given N bytes and looked for the unlucky batches that cause OOM discussed in the paper
 
 <table width="100%">
   <tr>
