@@ -218,6 +218,11 @@ class HNet(nn.Module):
             mask=mask,
             inference_params=inference_params.routing_module_state,
         )
+        
+        # Count boundary tokens at this stage
+        num_boundary_tokens = bpred_output.boundary_mask.sum().item()
+        print(f"Stage {self.stage_idx}: {num_boundary_tokens} boundary tokens")
+        
         hidden_states, next_cu_seqlens, next_max_seqlen, next_mask = self.chunk_layer(
             hidden_states, bpred_output.boundary_mask, cu_seqlens, mask=mask
         )

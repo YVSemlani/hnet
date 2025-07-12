@@ -12,7 +12,6 @@ from hnet.models.config_hnet import (
     HNetConfig,
 )
 
-
 class ByteTokenizer:
     def __init__(self):
         self.vocab_size = 256
@@ -97,6 +96,7 @@ def generate(
     Yields:
         Generated text token by token as strings
     """
+    
     device = next(model.parameters()).device
     tokenizer = ByteTokenizer()
 
