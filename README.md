@@ -1,11 +1,22 @@
 # H-Net
 
-![H-Net](assets/arch.png "H-Net Architecture")
+<table width="100%">
+  <tr>
+    <td><img src="assets/english.gif" alt="English" width="100%"></td>
+    <td><img src="assets/code.gif" alt="Code" width="100%"></td>
+  </tr>
+  <tr>
+    <td><img src="assets/chinese.gif" alt="Chinese" width="100%"></td>
+    <td><img src="assets/korean.gif" alt="Korean" width="100%"></td>
+  </tr>
+</table>
+
 > **Dynamic Chunking for End-to-End Hierarchical Sequence Modeling**\
 > Sukjun Hwang, Brandon Wang, Albert Gu\
 > Paper: https://arxiv.org/abs/2507.07955
 
 ## About
+![H-Net](assets/arch.png "H-Net Architecture")
 
 This repository contains code of the H-Net architecture. Most of the code lies in `hnet/`, which has the following structure:
 
