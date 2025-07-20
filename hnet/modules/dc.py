@@ -86,18 +86,12 @@ class RoutingModule(nn.Module):
             hidden_states = hidden_states.unsqueeze(0)
         if self.fused_dc:
             Q, K = self.q_proj_layer(hidden_states[:, :-1]), self.k_proj_layer(hidden_states[:, 1:])
-            #print(Q.shape, K.shape)
-            boundary_prob, boundary_mask = fused_dc(Q, K)
+            boundary_prob, boundary_mask, selected_probs = fused_dc(Q, K)
 
-            # ADD ALL OF THIS TO THE FUSED DC KERNEL
-            boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
-            boundary_mask = boundary_mask.bool()
-
-            selected_probs = torch.where(
-                boundary_mask.unsqueeze(-1),
-                boundary_prob[..., 1:2],  # probability of boundary
-                boundary_prob[..., 0:1]   # probability of no boundary
-            )
+            # print shapes
+            print(boundary_prob.shape)
+            print(boundary_mask.shape)
+            print(selected_probs.shape)
 
         else:
             cos_sim = torch.einsum(

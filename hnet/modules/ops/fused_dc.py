@@ -11,7 +11,6 @@ torch.set_float32_matmul_precision('high')
 
 Fused dynamic chunking kernel based off Triton's fused softmax tutorial
 
-
 """
 
 def get_cuda_autotune_config():
@@ -39,14 +38,17 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
             K_ptr, # B x (L - 1) x D
             p_ptr, # B x L - 1
             b_ptr, # B x L - 1
+            sp_ptr,
             Q_batch_stride,
             K_batch_stride,
             p_batch_stride,
             b_batch_stride,
+            sp_batch_stride,
             Q_row_stride,
             K_row_stride,
-            p_stride, # most likely 1
-            b_stride, # most likely 1
+            p_row_stride,
+            b_row_stride,
+            sp_row_stride,
             batch_dim, # add back when we use over multiple batches
             seq_len,
             head_dim,
@@ -64,11 +66,14 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
     K_batch_ptr = K_ptr + batch_start * K_batch_stride
     p_batch_ptr = p_ptr + batch_start * p_batch_stride
     b_batch_ptr = b_ptr + batch_start * b_batch_stride
+    sp_batch_ptr = sp_ptr + batch_start * sp_batch_stride
 
     # BOS token set as mandatory boundary for each sequence in the batch
     if row_start == 0:
-        tl.store(p_batch_ptr, 1.0)       
-        tl.store(b_batch_ptr, 1)
+        tl.store(p_batch_ptr + 0, 1.0)
+        tl.store(p_batch_ptr + 1, 0.0)      
+        tl.store(b_batch_ptr, True)
+        tl.store(sp_batch_ptr, 1.0)
 
     # number of row-blocks needed to cover the sequence
     num_blocks = (seq_len + ROW_PER_BLOCK - 1) // ROW_PER_BLOCK
@@ -99,16 +104,25 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
         dot_rows  = tl.sum(Q_tile * K_tile, axis=1)
         q_norm_sq = tl.sum(Q_tile * Q_tile, axis=1)
         k_norm_sq = tl.sum(K_tile * K_tile, axis=1)
-        cos_sim   = dot_rows / (tl.sqrt(q_norm_sq) * tl.sqrt(k_norm_sq))
-        p_vals    = tl.clamp((1 - cos_sim) / 2, 0.0, 1.0)
-        b_vals    = tl.where(p_vals >= 0.5, 1, 0)
+        cos_sim   = tl.fdiv(dot_rows, (tl.sqrt(q_norm_sq) * tl.sqrt(k_norm_sq)))
+
+        # compute final values
+        p_boundary = tl.clamp((1 - cos_sim) / 2, 0.0, 1.0)
+        p_noboundary = 1 - p_boundary
+        p = tl.join(p_noboundary, p_boundary)
+        b_vals = tl.where(p_boundary >= 0.5, True, False)
+        sp = tl.max(p_noboundary, p_boundary)
+
+        # compute store memory addresses
+        out_rows = row_offsets + 1
+        p_ptrs   = p_batch_ptr + out_rows * p_row_stride + tl.arange(2)
+        b_ptrs   = b_batch_ptr + out_rows * b_row_stride
+        sp_ptrs   = sp_batch_ptr + out_rows * sp_row_stride
 
         # store results
-        out_rows = row_offsets + 1
-        p_ptrs   = p_batch_ptr + out_rows * p_stride
-        b_ptrs   = b_batch_ptr + out_rows * b_stride
-        tl.store(p_ptrs, p_vals, mask=row_mask)
+        tl.store(p_ptrs, p, mask=row_mask)
         tl.store(b_ptrs, b_vals, mask=row_mask)
+        tl.store(sp_ptrs, sp, mask=row_mask)
         
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
@@ -130,11 +144,17 @@ def fused_dc(Q, K):
     num_warps = 8
     num_stages = 4
 
-    ROW_PER_BLOCK = num_warps
+    # each block has num_warps * 32 threads
+    # each thread can hold 4 FP32 values (we upcast to FP32)
+    # thus each block should get num_warps * 32 * 4 elements
+    # with 8 warps each block should load in 1024 values or 1 row at a time
+
+    ROW_PER_BLOCK = num_warps * 32 * 4 // seq_len
     num_blocks = (seq_len + ROW_PER_BLOCK - 1) // ROW_PER_BLOCK
 
-    p = torch.empty((batch_size, seq_len + 1), device=DEVICE, dtype=torch.bfloat16)
-    b = torch.empty_like(p)
+    p = torch.empty((batch_size, seq_len + 1, 2), device=DEVICE, dtype=torch.bfloat16)
+    b = torch.empty((batch_size, seq_len + 1), device=DEVICE, dtype=torch.bool)
+    sp = torch.empty((batch_size, seq_len + 1, 1), device=DEVICE, dtype=torch.bfloat16)
 
     # Create a number of persistent programs.
     fused_dc_kernel[(batch_size, num_blocks, 1)](
@@ -146,18 +166,19 @@ def fused_dc(Q, K):
         BLOCK_SIZE,
         num_stages,
     )
-    return p, b
+    return p, b, sp
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     Q = torch.randn(4, 8192, 1024, device=DEVICE, dtype=torch.bfloat16)
     K = torch.randn(4, 8192, 1024, device=DEVICE, dtype=torch.bfloat16)
 
-    p_triton, b_triton = fused_dc(Q, K)
+    p_triton, b_triton, sp_triton = fused_dc(Q, K)
 
     # detach
     p = p_triton.detach().cpu()
     b = b_triton.detach().cpu()
+    sp = sp_triton.detach().cpu()
 
 
 
