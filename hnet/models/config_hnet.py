@@ -29,3 +29,4 @@ class HNetConfig:
     ssm_cfg: SSMConfig = field(default_factory=SSMConfig)
     attn_cfg: AttnConfig = field(default_factory=AttnConfig)
     tie_embeddings: bool = False
+    fused_dc: bool = False

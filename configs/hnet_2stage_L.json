@@ -14,5 +14,6 @@
         "rotary_emb_dim": [32, 32, 48],
         "window_size": [1023, 1023, -1]
     },
-    "tie_embeddings": false
+    "tie_embeddings": false,
+    "fused_dc": false
 }

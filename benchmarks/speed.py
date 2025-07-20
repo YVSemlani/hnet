@@ -4,6 +4,8 @@ import torch
 import argparse
 import sys
 from omegaconf import ListConfig
+import time
+import timeit
 
 from hnet.models.mixer_seq import HNetForCausalLM
 from hnet.models.config_hnet import (
@@ -11,7 +13,6 @@ from hnet.models.config_hnet import (
     SSMConfig,
     HNetConfig,
 )
-
 
 class ByteTokenizer:
     def __init__(self):
@@ -107,7 +108,7 @@ def generate(
     ).unsqueeze(0)
 
     print(f"Input IDs shape: {input_ids.shape}")
-    print(f"Input IDs: {input_ids}")
+    print(f"Input IDs dtype: {input_ids.dtype}")
 
     inference_cache = model.allocate_inference_cache(
         1, input_ids.shape[1] + max_tokens, dtype=torch.bfloat16
@@ -160,12 +161,6 @@ def main():
         help="Path to the model checkpoint (.pt file)",
     )
     parser.add_argument(
-        "--config-path",
-        type=str,
-        required=True,
-        help="Path to the model configuration (.json file)",
-    )
-    parser.add_argument(
         "--max-tokens",
         type=int,
         default=1024,
@@ -184,53 +179,89 @@ def main():
         help="Top-p sampling parameter (default: 1.0)",
     )
     args = parser.parse_args()
+    print("DEBUG: Entered main()", file=sys.stderr, flush=True)
 
     print("Loading model...")
-    try:
-        model = load_from_pretrained(args.model_path, args.config_path)
-        print("Model loaded successfully!")
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        sys.exit(1)
+
+    configs = ['configs/hnet_2stage_XL_fused.json', 'configs/hnet_2stage_XL.json']
 
     tokenizer = ByteTokenizer()
 
-    while True:
-        prompt = input("\nPrompt: ").strip()
+    with open("./prompts/speed_prompt.txt", "r") as f:
+        prompt = f.read()
 
-        if not prompt:
-            continue
+    print(f"Prompt length: {len(prompt)} characters", file=sys.stderr)
+    print(f"Prompt preview: {prompt[:100]}...", file=sys.stderr)
 
-        print(
-            f"\nGenerating (max_tokens={args.max_tokens}, temperature={args.temperature}, top_p={args.top_p})"
-        )
+    for config in configs:
+        try:
+            model = load_from_pretrained(args.model_path, config)
+            print(f"Loading model {config}...")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            sys.exit(1)
 
-        print(f"\033[92m{prompt}\033[0m", end="")
-        token_count = 0
-        buf = []
+        num_iters = 0
 
-        for token in generate(
-            model,
-            prompt,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-        ):
-            buf.append(token)
-            token_count += 1
+        ttft = []
+        throughput = []
+        while num_iters < 10:
+            num_iters += 1
+            prompt = "tell me about large language models"
 
-            decoded = None
-            res = None
-            for j in range(1, min(len(buf), 4)):
-                try:
-                    res = tokenizer.decode(buf[:j])
-                    decoded = j
-                except:
-                    pass
+            if not prompt:
+                continue
 
-            if res is not None:
-                print(res, end="", flush=True)
-                buf = buf[decoded:]
+            print(
+                f"\nGenerating (max_tokens={args.max_tokens}, temperature={args.temperature}, top_p={args.top_p})"
+            )
+
+            #print(f"\033[92m{prompt}\033[0m", end="")
+            # Start timing for throughput and time-to-first-token
+            start_time = time.perf_counter()
+            first_token_measured = False
+            print("\033[92m[Debug] Timer started\033[0m", file=sys.stderr, flush=True)
+            token_count = 0
+            buf = []
+
+            for token in generate(
+                model,
+                prompt,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+            ):
+                buf.append(token)
+                token_count += 1
+                # Measure time to first token
+                if not first_token_measured:
+                    time_to_first = time.perf_counter() - start_time
+                    print(f"\n\033[91mTime to first token: {time_to_first*1000:.5f} ms\033[0m", file=sys.stderr, flush=True)
+                    ttft.append(time_to_first)
+                    first_token_measured = True
+
+                decoded = None
+                res = None
+                for j in range(1, min(len(buf), 4)):
+                    try:
+                        res = tokenizer.decode(buf[:j])
+                        decoded = j
+                    except:
+                        pass
+
+                if res is not None:
+                    #print(res, end="", flush=True)
+                    buf = buf[decoded:]
+
+            # Compute and display overall throughput
+            end_time = time.perf_counter()
+            elapsed = end_time - start_time
+            throughput_tokens_per_second = token_count / elapsed if elapsed > 0 else float('inf')
+            print(f"\n\033[91mThroughput: {throughput_tokens_per_second:.5f} tokens/sec (elapsed: {elapsed*1000:.5f} ms)\033[0m", file=sys.stderr, flush=True)
+            throughput.append(throughput_tokens_per_second)
+
+        print(f"\033[94mAverage time to first token: {np.mean(ttft[1:])*1000:.5f} ms\033[0m", file=sys.stderr, flush=True)
+        print(f"\033[94mAverage throughput: {np.mean(throughput[1:]):.5f} tokens/sec\033[0m", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
