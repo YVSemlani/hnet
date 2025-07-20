@@ -107,6 +107,9 @@ def generate(
         encoded["input_ids"], dtype=torch.long, device=device
     ).unsqueeze(0)
 
+    print(f"Input IDs shape: {input_ids.shape}")
+    print(f"Input IDs dtype: {input_ids.dtype}")
+
     inference_cache = model.allocate_inference_cache(
         1, input_ids.shape[1] + max_tokens, dtype=torch.bfloat16
     )
@@ -158,12 +161,6 @@ def main():
         help="Path to the model checkpoint (.pt file)",
     )
     parser.add_argument(
-        "--config-path",
-        type=str,
-        required=True,
-        help="Path to the model configuration (.json file)",
-    )
-    parser.add_argument(
         "--max-tokens",
         type=int,
         default=1024,
@@ -186,11 +183,11 @@ def main():
 
     print("Loading model...")
 
-    configs = ['configs/hnet_2stage_L_fused.json', 'configs/hnet_2stage_L.json']
+    configs = ['configs/hnet_2stage_XL_fused.json', 'configs/hnet_2stage_XL.json']
 
     tokenizer = ByteTokenizer()
 
-    with open("speed_prompt.txt", "r") as f:
+    with open("./prompts/speed_prompt.txt", "r") as f:
         prompt = f.read()
 
     print(f"Prompt length: {len(prompt)} characters", file=sys.stderr)
@@ -210,7 +207,7 @@ def main():
         throughput = []
         while num_iters < 10:
             num_iters += 1
-            #prompt = "tell me about large language models"
+            prompt = "tell me about large language models"
 
             if not prompt:
                 continue

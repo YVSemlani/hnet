@@ -5,6 +5,7 @@ import triton.language as tl
 from triton.runtime import driver
 
 DEVICE = driver.active.get_active_torch_device()
+torch.set_float32_matmul_precision('high')
 
 """
 

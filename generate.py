@@ -106,6 +106,9 @@ def generate(
         encoded["input_ids"], dtype=torch.long, device=device
     ).unsqueeze(0)
 
+    print(f"Input IDs shape: {input_ids.shape}")
+    print(f"Input IDs: {input_ids}")
+
     inference_cache = model.allocate_inference_cache(
         1, input_ids.shape[1] + max_tokens, dtype=torch.bfloat16
     )

@@ -86,6 +86,7 @@ class RoutingModule(nn.Module):
             hidden_states = hidden_states.unsqueeze(0)
         if self.fused_dc:
             Q, K = self.q_proj_layer(hidden_states[:, :-1]), self.k_proj_layer(hidden_states[:, 1:])
+            #print(Q.shape, K.shape)
             boundary_prob, boundary_mask = fused_dc(Q, K)
 
             # ADD ALL OF THIS TO THE FUSED DC KERNEL

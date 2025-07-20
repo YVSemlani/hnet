@@ -15,5 +15,5 @@
         "window_size": [1023, 1023, -1]
     },
     "tie_embeddings": false,
-    "fused_dc": false
+    "fused_dc": true
 }
