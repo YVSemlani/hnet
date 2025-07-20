@@ -1,5 +1,4 @@
 # benchmark end2end generation speed with and without fused dc
-
 import torch
 import torch.nn.functional as F
 
@@ -7,7 +6,8 @@ import triton
 import triton.language as tl
 from triton.runtime import driver
 
-import json 
+import json
+import os 
 
 from hnet.models.mixer_seq import HNetForCausalLM
 from hnet.models.config_hnet import (
@@ -22,9 +22,10 @@ import numpy as np
 import time
 
 import matplotlib.pyplot as plt
+import pandas as pd
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-torch.set_float32_matmul_precision('high')
+#torch.set_float32_matmul_precision('high')
 
 class ByteTokenizer:
     def __init__(self):
@@ -121,17 +122,20 @@ def benchmark(model, input_ids, mask, inference_cache, warmup=3, iters=10):
     return total_ms / iters
 
 if __name__ == "__main__":
-    results_path = "reports/prefill.png"
+    results_dir = "reports/prefill"
+    os.makedirs(results_dir, exist_ok=True)
+    
     model_path = "hf/hnet_2stage_XL.pt"
     model_configs = ["configs/hnet_2stage_XL_fused.json", "configs/hnet_2stage_XL.json"]
+    model_names = ["Fused", "Unfused"]
     MODELS = []
     MAX_TOKENS = 1024
     results = {}
-    for model_config in model_configs:
+    for model_idx, model_config in enumerate(model_configs):
         model = load_from_pretrained(model_path, model_config)
         #print(model)
         MODELS.append(model)
-        results[model_config] = []
+        results[model_names[model_idx]] = []
         print(f"Loaded model {model_config}")
 
 
@@ -151,8 +155,8 @@ if __name__ == "__main__":
                 1, input_ids.shape[1] + MAX_TOKENS, dtype=torch.bfloat16
             )
             avg_ms = benchmark(model, input_ids, mask, inference_cache)
-            print(f"{model_configs[model_idx]} prefill for {seq_len} tokens took {avg_ms:.6f} ms")
-            results[model_configs[model_idx]].append(avg_ms)
+            print(f"{model_names[model_idx]} prefill for {seq_len} tokens took {avg_ms:.6f} ms")
+            results[model_names[model_idx]].append(avg_ms)
         # cleanup
         del input_ids
         del mask
@@ -161,9 +165,14 @@ if __name__ == "__main__":
         gc.collect()
 
     # plot results
-    for model_config, times in results.items():
-        plt.plot(seq_lens, times, label=model_config)
+    for model_name, times in results.items():
+        plt.plot(seq_lens, times, label=model_name)
     plt.xlabel("Sequence Length")
     plt.ylabel("Average Prefill Time w/ 3 warmup & 10 iters (ms)")
     plt.legend()
-    plt.savefig(results_path)
+    plt.savefig(f"{results_dir}/prefill.png")
+
+    # save results to csv
+    df = pd.DataFrame(results)
+    df["% Speedup"] = (df["Unfused"] - df["Fused"]) / df["Unfused"] * 100
+    df.to_csv(f"{results_dir}/prefill.csv", index=False)

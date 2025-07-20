@@ -8,10 +8,11 @@ from hnet.modules.ops.fused_dc import fused_dc
 import torch
 import torch.nn.functional as F
 import gc
+import pandas as pd
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-RUN_NAME = "Short-Sequence"
+RUN_NAME = "Routing Module Benchmark"
 
 def run_dc(x, mask, routing_module):
     return routing_module(x, mask=mask)
@@ -27,7 +28,7 @@ def run_fused_dc(x, q_proj, k_proj):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['BATCH_SIZE'],  # argument names to use as an x-axis for the plot
-        x_vals=[2 ** i for i in range(2, 9)],  # different possible values for `x_name`
+        x_vals=[2 ** i for i in range(0, 9)],  # different possible values for `x_name`
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
         line_vals=['triton', 'torch'],  # possible values for `line_arg``
         line_names=[
@@ -62,5 +63,11 @@ def benchmark(BATCH_SIZE, SEQ_LEN, HEAD_DIM, provider):
     gc.collect()
     return ms
 
+if __name__ == "__main__":
+    save_path = "reports/routing"
+    benchmark.run(show_plots=True, print_data=True, save_path=save_path)
 
-benchmark.run(show_plots=True, print_data=True, save_path="reports/routing")
+    # add a percent speedup to the saved csv
+    df = pd.read_csv(f"{save_path}/{RUN_NAME}.csv")
+    df["% Speedup"] = (df["Unfused"] - df["Fused"]) / df["Unfused"] * 100
+    df.to_csv(f"{save_path}/{RUN_NAME}.csv", index=False)
