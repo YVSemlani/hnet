@@ -240,9 +240,8 @@ class HNet(nn.Module):
             inference_params=inference_params.dechunk_state,
         )
 
-        selected_probs = ste_func(bpred_output.selected_probs)
         hidden_states = self.residual_func(
-            hidden_states.to(dtype=residual.dtype), residual, selected_probs
+            hidden_states.to(dtype=residual.dtype), residual, bpred_output.selected_probs
         ).to(hidden_states.dtype)
 
         hidden_states = self.decoder(
@@ -303,9 +302,8 @@ class HNet(nn.Module):
             inference_params.dechunk_state,
         )
 
-        selected_probs = ste_func(bpred_output.selected_probs)
         hidden_states = self.residual_func(
-            hidden_states.to(dtype=residual.dtype), residual, selected_probs
+            hidden_states.to(dtype=residual.dtype), residual, bpred_output.selected_probs
         ).to(hidden_states.dtype)
 
         hidden_states = self.decoder.step(hidden_states, inference_params.decoder_state)
