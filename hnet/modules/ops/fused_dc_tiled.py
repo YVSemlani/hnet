@@ -5,13 +5,6 @@ import triton.language as tl
 from triton.runtime import driver
 
 DEVICE = driver.active.get_active_torch_device()
-torch.set_float32_matmul_precision('high')
-
-"""
-
-Fused dynamic chunking kernel based off Triton's fused softmax tutorial.
-
-"""
 
 def get_cuda_autotune_config():
     return [
@@ -34,106 +27,108 @@ def is_cdna():
                                                                                    'gfx90a', 'gfx908')
 
 @triton.jit
-def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
-            K_ptr, # B x (L - 1) x D
-            p_ptr, # B x L - 1
-            b_ptr, # B x L - 1
-            sp_ptr,
-            Q_batch_stride,
-            K_batch_stride,
-            p_batch_stride,
-            b_batch_stride,
-            sp_batch_stride,
-            Q_row_stride,
-            K_row_stride,
-            p_row_stride,
-            b_row_stride,
-            sp_row_stride,
-            batch_dim, # add back when we use over multiple batches
-            seq_len,
-            head_dim,
-            ROW_PER_BLOCK: tl.constexpr,
-            BLOCK_SIZE: tl.constexpr,
-            num_stages: tl.constexpr
-            ):
+def fused_dc_kernel_tiled(
+        Q_ptr, K_ptr, p_ptr, b_ptr, sp_ptr,
+        Q_batch_stride, K_batch_stride, p_batch_stride, b_batch_stride, sp_batch_stride,
+        Q_row_stride, K_row_stride, p_row_stride, b_row_stride, sp_row_stride,
+        batch_dim, seq_len, head_dim, # Q and K shapes
+        BLOCK_SIZE: tl.constexpr,
+        num_stages: tl.constexpr # pipeline stages
+):
+    # each block handles BLOCK_SIZE_SD tokens in the sequence
+    batch_idx = tl.program_id(0)
+    row_idx = tl.program_id(1) * BLOCK_SIZE # iterate over the sequence dim in steps of BLOCK_SIZE_SD
 
-    batch_start = tl.program_id(0) # grid x axis handles a single sequence in the batch
-    row_start = tl.program_id(1) # assume singular batch dim for now
-    row_step = tl.num_programs(1) # grid y axis handles an entire sequence in the batch
+    # get the starting pointer for this element in the batch
+    Q_batch_ptr = Q_ptr + batch_idx * Q_batch_stride
+    K_batch_ptr = K_ptr + batch_idx * K_batch_stride
+    p_batch_ptr = p_ptr + batch_idx * p_batch_stride
+    b_batch_ptr = b_ptr + batch_idx * b_batch_stride
+    sp_batch_ptr = sp_ptr + batch_idx * sp_batch_stride
 
-    # get starting pointer for this element in the batch
-    Q_batch_ptr = Q_ptr + batch_start * Q_batch_stride
-    K_batch_ptr = K_ptr + batch_start * K_batch_stride
-    p_batch_ptr = p_ptr + batch_start * p_batch_stride
-    b_batch_ptr = b_ptr + batch_start * b_batch_stride
-    sp_batch_ptr = sp_ptr + batch_start * sp_batch_stride
-
-    # BOS token set as mandatory boundary for each sequence in the batch
-    if row_start == 0:
-        tl.store(p_batch_ptr + 0, 0.0) # p no boundary
-        tl.store(p_batch_ptr + 1, 1.0) # p boundary     
+    # set BOS token to mandatory boundary
+    if row_idx == 0:
+        tl.store(p_batch_ptr, 0.0)
+        tl.store(p_batch_ptr + 1, 1.0)
         tl.store(b_batch_ptr, True)
         tl.store(sp_batch_ptr, 1.0)
 
-    # number of row-blocks needed to cover the sequence
-    num_blocks = (seq_len + ROW_PER_BLOCK - 1) // ROW_PER_BLOCK
+    # get the starting point for each row we're processing
+    row_offsets = row_idx + tl.arange(0, BLOCK_SIZE)
+    row_mask = row_offsets < seq_len
+    Q_tile_ptr = Q_batch_ptr + row_offsets[:, None] * Q_row_stride
+    K_tile_ptr = K_batch_ptr + row_offsets[:, None] * K_row_stride
 
-    # instead of load row -> make unit vector -> back to global memory -> load normed row -> dot prod -> back to global memory -> get probabilities -> get boundaries
-    # we want load row -> make unit vector -> dot prod -> get probabilities -> get boundaries -> back to global memory -> load clientside
+    # setup accumulator
+    QKt = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.bfloat16)
+    Qnorm = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
+    Knorm = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
 
-    for block_id in tl.range(row_start, num_blocks, row_step, num_stages=num_stages):
-        # compute row indices for this block
-        row_idx     = tl.arange(0, ROW_PER_BLOCK)
-        row_offsets = block_id * ROW_PER_BLOCK + row_idx
-        row_mask    = row_offsets < seq_len
-        safe_row_offsets = tl.where(row_mask, row_offsets, 0)
+    # iterate over the head dimension in blocks of BLOCK_SIZE_HD
+    for head_idx in tl.arange(0, head_dim, BLOCK_SIZE, num_stages=num_stages):
+        # compute the head dimension offsets
+        head_offsets = head_idx + tl.arange(0, BLOCK_SIZE)
+        head_mask = head_offsets < head_dim
 
-        # compute column offsets
-        col_offsets = tl.arange(0, BLOCK_SIZE)
-        col_mask    = col_offsets < head_dim
-
-        # generate 2D pointer grids for Q and K
-        Q_ptrs = Q_batch_ptr + (safe_row_offsets[:, None] * Q_row_stride) + col_offsets[None, :]
-        K_ptrs = K_batch_ptr + (safe_row_offsets[:, None] * K_row_stride) + col_offsets[None, :]
-
+        # create 2D pointer grid for Q and K by advancing by head offsets along the head dim of each row
+        Q_ptrs = Q_tile_ptr + (head_offsets[:, None])
+        K_ptrs = K_tile_ptr + (head_offsets[:, None])
+        
         # load tiles
-        mask2d = row_mask[:, None] & col_mask[None, :]
-        Q_tile = tl.load(Q_ptrs, mask=mask2d, other=0.0).to(tl.float32)
-        K_tile = tl.load(K_ptrs, mask=mask2d, other=0.0).to(tl.float32)
+        mask2d = row_mask[:, None] & head_mask[None, :]
+        Q_tile = tl.load(Q_ptrs, mask=mask2d, other=0.0)
+        K_tile = tl.load(K_ptrs, mask=mask2d, other=0.0)
 
-        # compute per-row dot and norms
-        dot_rows  = tl.sum(Q_tile * K_tile, axis=1)
-        q_norm_sq = tl.sum(Q_tile * Q_tile, axis=1)
-        k_norm_sq = tl.sum(K_tile * K_tile, axis=1)
-        cos_sim   = tl.fdiv(dot_rows, (tl.sqrt(q_norm_sq) * tl.sqrt(k_norm_sq)))
+        # update accumulators
+        QKt += tl.dot(Q_tile, K_tile.T)
+        Qnorm += tl.dot(Q_tile, Q_tile.T)
+        Knorm += tl.dot(K_tile, K_tile.T)
+    
+    # mask out non-diagonal elements of accumulators
+    QKt = tl.where(tl.arange(0, BLOCK_SIZE)[None, :] == tl.arange(0, BLOCK_SIZE)[:, None], QKt, 0.0)
+    Qnorm = tl.where(tl.arange(0, BLOCK_SIZE)[None, :] == tl.arange(0, BLOCK_SIZE)[:, None], Qnorm, 0.0)
+    Knorm = tl.where(tl.arange(0, BLOCK_SIZE)[None, :] == tl.arange(0, BLOCK_SIZE)[:, None], Knorm, 0.0)
 
-        # compute final values
-        p_boundary = tl.clamp((1 - cos_sim) / 2, 0.0, 1.0)
-        p_noboundary = 1 - p_boundary
-        p = tl.join(p_noboundary, p_boundary)
-        b_vals = tl.where(p_boundary >= 0.5, True, False)
-        sp = tl.maximum(p_noboundary, p_boundary)
+    # compute cosine similarity using dot products
+    norm = tl.sqrt(tl.dot(Qnorm, Knorm))
+    cos_sim = tl.fdiv(QKt, norm)
 
-        # compute store memory addresses
-        out_rows = row_offsets + 1
-        safe_out_rows = tl.where(row_mask, out_rows, 0)
-        
-        # column offsets for two entries
-        col_idxs = tl.arange(0, 2)[None, :]
-        # row indices broadcasted across columns
-        row_idxs = out_rows[:, None]
-        # compute pointer grid for p
-        p_ptrs  = p_batch_ptr + safe_out_rows[:, None] * p_row_stride + col_idxs
-        b_ptrs  = b_batch_ptr + safe_out_rows * b_row_stride
-        sp_ptrs = sp_batch_ptr + safe_out_rows * sp_row_stride
+    # get diagonal elements of cosine similarity accumulator
+    diag_indices = tl.arange(0, BLOCK_SIZE)
+    cos_sim = cos_sim[diag_indices, diag_indices]
 
-        # store results with proper bounds checking
-        # Create 2D mask for p tensor to match its [ROW_PER_BLOCK, 2] shape
-        p_mask = row_mask[:, None]
-        tl.store(p_ptrs, p, mask=p_mask)
-        tl.store(b_ptrs, b_vals, mask=row_mask)
-        tl.store(sp_ptrs, sp, mask=row_mask)
-        
+    # compute probabilities
+    p_boundary = tl.clamp((1 - cos_sim) / 2, 0.0, 1.0)
+    p_noboundary = 1 - p_boundary
+
+    # compute boundaries
+    b = tl.where(p_boundary >= 0.5, True, False)
+
+    # combine probabilities
+    p = tl.join(p_noboundary, p_boundary)
+
+    # compute selected probabilities
+    sp = tl.maximum(p_noboundary, p_boundary)
+
+    # get offsets for p_noboundary and p_boundary
+    p_offsets = tl.arange(0, 2)[None, :]
+
+    # write one row ahead since we place first token manually
+    row_offsets = row_offsets + 1
+
+    # compute store memory addresses
+    p_ptrs = p_batch_ptr + row_offsets[:, None] * p_row_stride + p_offsets
+    b_ptrs = b_batch_ptr + row_offsets[:, None] * b_row_stride
+    sp_ptrs = sp_batch_ptr + row_offsets[:, None] * sp_row_stride
+
+    # mask so we don't exceed batch_size * seq_len memory addresses for b, and sp or batch_size * seq_len 
+    row_mask = row_offsets < seq_len
+    p_mask = row_mask[:, None] & tl.arange(0, 2)[None, :] < 2
+
+    # store results
+    tl.store(p_ptrs, p, mask=p_mask)
+    tl.store(b_ptrs, b, mask=row_mask)
+    tl.store(sp_ptrs, sp, mask=row_mask)
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]
@@ -143,7 +138,6 @@ WARP_SIZE = properties["warpSize"]
 target = triton.runtime.driver.active.get_current_target()
 kernels = {}
 
-# we're ignoring batch length right now
 def fused_dc(Q, K):
     assert Q.shape == K.shape, "Q and K must have the same shape"
     assert Q.dim() == 3, "Q and K must be 3D tensors"
@@ -154,22 +148,21 @@ def fused_dc(Q, K):
 
     num_warps = 8
     num_stages = 4
+    BLOCK_SIZE = 64 # 64 to enable WGMMA
 
-    # FIX: Ensure ROW_PER_BLOCK doesn't cause overflow
-    ROW_PER_BLOCK = min(num_warps // 2, 32)  # Cap at reasonable value
-    num_blocks = (seq_len + ROW_PER_BLOCK - 1) // ROW_PER_BLOCK
+
+    num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     p = torch.empty((batch_size, seq_len + 1, 2), device=DEVICE, dtype=torch.bfloat16)
     b = torch.empty((batch_size, seq_len + 1), device=DEVICE, dtype=torch.bool)
     sp = torch.empty((batch_size, seq_len + 1, 1), device=DEVICE, dtype=torch.bfloat16)
 
     # Create a number of persistent programs.
-    fused_dc_kernel[(batch_size, num_blocks, 1)](
+    fused_dc_kernel_tiled[(batch_size, num_blocks, 1)](
         Q, K, p, b, sp,
         Q.stride(0), K.stride(0), p.stride(0), b.stride(0), sp.stride(0),
         Q.stride(1), K.stride(1), p.stride(1), b.stride(1), sp.stride(1),
         batch_size, seq_len, head_dim,
-        ROW_PER_BLOCK,
         BLOCK_SIZE,
         num_stages,
     )
