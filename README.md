@@ -48,6 +48,20 @@ uv run prefill.py
 uv run routing.py
 ```
 
+## Testing
+
+### Fused DC
+
+```
+uv run tests/fused_dc.py
+```
+Default behavior of routing module is to initialize the q and k projection layers to the identity matrix. This makes tests pass that shouldn't as we don't see precision errors that arise. If running this test without loading from a pretrained model comment out the below lines: 
+
+```
+with torch.no_grad():
+    self.q_proj_layer.weight.copy_(torch.eye(d_model))
+    self.k_proj_layer.weight.copy_(torch.eye(d_model))
+```
 ### Generation
 ```
 uv run generate.py --model-path hf/hnet_2stage_XL.pt --config-path configs/hnet_2stage_XL.json --max-tokens 1024 --temperature 1.0 --top-p 1.0

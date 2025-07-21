@@ -157,6 +157,8 @@ class Isotropic(nn.Module):
                 # Currently supporting only Mamba2 and MHA
                 raise NotImplementedError
 
+            #print(f"hidden_states shape: {hidden_states.shape}")
+
             hidden_states, residual = layer(
                 hidden_states,
                 residual,
