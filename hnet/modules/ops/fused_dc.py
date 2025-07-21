@@ -68,10 +68,9 @@ def fused_dc_kernel(Q_ptr, # B x (L - 1) x D
     b_batch_ptr = b_ptr + batch_start * b_batch_stride
     sp_batch_ptr = sp_ptr + batch_start * sp_batch_stride
 
-    # BOS token set as mandatory boundary for each sequence in the batch
     if row_start == 0:
-        tl.store(p_batch_ptr + 0, 0.0) # p no boundary
-        tl.store(p_batch_ptr + 1, 1.0) # p boundary     
+        tl.store(p_batch_ptr, 0.0)
+        tl.store(p_batch_ptr + 1, 1.0)
         tl.store(b_batch_ptr, True)
         tl.store(sp_batch_ptr, 1.0)
 
@@ -162,6 +161,11 @@ def fused_dc(Q, K):
     p = torch.empty((batch_size, seq_len + 1, 2), device=DEVICE, dtype=torch.bfloat16)
     b = torch.empty((batch_size, seq_len + 1), device=DEVICE, dtype=torch.bool)
     sp = torch.empty((batch_size, seq_len + 1, 1), device=DEVICE, dtype=torch.bfloat16)
+
+    # pad device side REMOVE THIS EVENTUALLY
+    p[:, 0, :] = 0.0
+    b[:, 0] = True
+    sp[:, 0, :] = 1.0
 
     # Create a number of persistent programs.
     fused_dc_kernel[(batch_size, num_blocks, 1)](

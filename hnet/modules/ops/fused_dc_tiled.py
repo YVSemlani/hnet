@@ -1,3 +1,4 @@
+from sympy import true
 import torch
 
 import triton
@@ -5,6 +6,7 @@ import triton.language as tl
 from triton.runtime import driver
 
 DEVICE = driver.active.get_active_torch_device()
+torch.set_float32_matmul_precision('high')
 
 def get_cuda_autotune_config():
     return [
@@ -60,42 +62,46 @@ def fused_dc_kernel_tiled(
     K_tile_ptr = K_batch_ptr + row_offsets[:, None] * K_row_stride
 
     # setup accumulator
-    QKt = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.bfloat16)
+    QKt = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
     Qnorm = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
     Knorm = tl.zeros((BLOCK_SIZE, BLOCK_SIZE), dtype=tl.float32)
 
     # iterate over the head dimension in blocks of BLOCK_SIZE_HD
-    for head_idx in tl.arange(0, head_dim, BLOCK_SIZE, num_stages=num_stages):
+    for head_idx in tl.range(0, head_dim, BLOCK_SIZE, num_stages=num_stages):
         # compute the head dimension offsets
         head_offsets = head_idx + tl.arange(0, BLOCK_SIZE)
         head_mask = head_offsets < head_dim
 
         # create 2D pointer grid for Q and K by advancing by head offsets along the head dim of each row
-        Q_ptrs = Q_tile_ptr + (head_offsets[:, None])
-        K_ptrs = K_tile_ptr + (head_offsets[:, None])
+        Q_ptrs = Q_tile_ptr + (head_offsets[None, :])
+        K_ptrs = K_tile_ptr + (head_offsets[None, :])
         
         # load tiles
         mask2d = row_mask[:, None] & head_mask[None, :]
-        Q_tile = tl.load(Q_ptrs, mask=mask2d, other=0.0)
-        K_tile = tl.load(K_ptrs, mask=mask2d, other=0.0)
+        Q_tile = tl.load(Q_ptrs, mask=mask2d, other=0.0).to(tl.float32)
+        K_tile = tl.load(K_ptrs, mask=mask2d, other=0.0).to(tl.float32)
 
         # update accumulators
-        QKt += tl.dot(Q_tile, K_tile.T)
-        Qnorm += tl.dot(Q_tile, Q_tile.T)
-        Knorm += tl.dot(K_tile, K_tile.T)
-    
-    # mask out non-diagonal elements of accumulators
-    QKt = tl.where(tl.arange(0, BLOCK_SIZE)[None, :] == tl.arange(0, BLOCK_SIZE)[:, None], QKt, 0.0)
-    Qnorm = tl.where(tl.arange(0, BLOCK_SIZE)[None, :] == tl.arange(0, BLOCK_SIZE)[:, None], Qnorm, 0.0)
-    Knorm = tl.where(tl.arange(0, BLOCK_SIZE)[None, :] == tl.arange(0, BLOCK_SIZE)[:, None], Knorm, 0.0)
+        QKt += tl.dot(Q_tile, K_tile.trans(1, 0))
+        Qnorm += tl.dot(Q_tile, Q_tile.trans(1, 0))
+        Knorm += tl.dot(K_tile, K_tile.trans(1, 0))
+
+    # grab diagonal elements of QKt, Qnorm, and Knorm by elementwise multiplication with identity matrix
+    diag_indices = tl.arange(0, BLOCK_SIZE)
+    identity = tl.where(diag_indices[:, None] == diag_indices[None, :], 1.0, 0.0)
+    QKt_diag = tl.sum(QKt * identity, axis=1)  # Sum along rows
+    Qnorm_diag = tl.sum(Qnorm * identity, axis=1)
+    Knorm_diag = tl.sum(Knorm * identity, axis=1)
 
     # compute cosine similarity using dot products
-    norm = tl.sqrt(tl.dot(Qnorm, Knorm))
-    cos_sim = tl.fdiv(QKt, norm)
+    norm = tl.sqrt(Qnorm_diag * Knorm_diag) + 1e-12
+    cos_sim = tl.fdiv(QKt_diag, norm)
 
-    # get diagonal elements of cosine similarity accumulator
-    diag_indices = tl.arange(0, BLOCK_SIZE)
-    cos_sim = cos_sim[diag_indices, diag_indices]
+    tl.static_print(norm)
+    tl.static_print(cos_sim)
+
+    # get diagonal elements of cosine similarity accumulator using a reduction operator
+    #cos_sim = tl.max(cos_sim, axis=1)
 
     # compute probabilities
     p_boundary = tl.clamp((1 - cos_sim) / 2, 0.0, 1.0)
@@ -114,21 +120,21 @@ def fused_dc_kernel_tiled(
     p_offsets = tl.arange(0, 2)[None, :]
 
     # write one row ahead since we place first token manually
-    row_offsets = row_offsets + 1
+    out_row_offsets = row_offsets + 1
 
     # compute store memory addresses
-    p_ptrs = p_batch_ptr + row_offsets[:, None] * p_row_stride + p_offsets
-    b_ptrs = b_batch_ptr + row_offsets[:, None] * b_row_stride
-    sp_ptrs = sp_batch_ptr + row_offsets[:, None] * sp_row_stride
+    p_ptrs = p_batch_ptr + out_row_offsets[:, None] * p_row_stride + p_offsets
+    b_ptrs = b_batch_ptr + out_row_offsets * b_row_stride
+    sp_ptrs = sp_batch_ptr + out_row_offsets * sp_row_stride
 
     # mask so we don't exceed batch_size * seq_len memory addresses for b, and sp or batch_size * seq_len 
-    row_mask = row_offsets < seq_len
-    p_mask = row_mask[:, None] & tl.arange(0, 2)[None, :] < 2
+    out_row_mask = out_row_offsets < seq_len
+    p_mask = out_row_mask[:, None] & tl.arange(0, 2)[None, :] < 2
 
     # store results
     tl.store(p_ptrs, p, mask=p_mask)
-    tl.store(b_ptrs, b, mask=row_mask)
-    tl.store(sp_ptrs, sp, mask=row_mask)
+    tl.store(b_ptrs, b, mask=out_row_mask)
+    tl.store(sp_ptrs, sp, mask=out_row_mask)
 
 properties = driver.active.utils.get_device_properties(DEVICE.index)
 NUM_SM = properties["multiprocessor_count"]
@@ -138,7 +144,7 @@ WARP_SIZE = properties["warpSize"]
 target = triton.runtime.driver.active.get_current_target()
 kernels = {}
 
-def fused_dc(Q, K):
+def fused_dc_tiled(Q, K):
     assert Q.shape == K.shape, "Q and K must have the same shape"
     assert Q.dim() == 3, "Q and K must be 3D tensors"
     
@@ -173,7 +179,7 @@ if __name__ == "__main__":
     Q = torch.randn(4, 8192, 1024, device=DEVICE, dtype=torch.bfloat16)
     K = torch.randn(4, 8192, 1024, device=DEVICE, dtype=torch.bfloat16)
 
-    p_triton, b_triton, sp_triton = fused_dc(Q, K)
+    p_triton, b_triton, sp_triton = fused_dc_tiled(Q, K)
 
     # detach
     p = p_triton.detach().cpu()

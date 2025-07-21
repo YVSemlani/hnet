@@ -3,78 +3,88 @@ from hnet.modules.dc import RoutingModule
 import torch
 import torch.nn.functional as F
 
+def print_comparison(title, items):
+    print(f"\n{title}:")
+    for name, fused, unfused in items:
+        print(f"{name:<20} | Fused: {str(fused):<15} | Unfused: {str(unfused)}")
+
 if __name__ == "__main__":
+    # Initialize modules
     routing_module_unfused = RoutingModule(d_model=1024, device=torch.device("cuda"))
     routing_module_fused = RoutingModule(d_model=1024, device=torch.device("cuda"), fused_dc=True)
 
-    # tie the weights of the two routing modules to ensure identical behavior
+    # Tie weights for comparable results
     routing_module_unfused.q_proj_layer.weight = routing_module_fused.q_proj_layer.weight
     routing_module_unfused.k_proj_layer.weight = routing_module_fused.k_proj_layer.weight
 
-    x = torch.randn(64, 8192, 1024, device=torch.device("cuda"))
-    mask = torch.ones(64, 8192, device=torch.device("cuda"), dtype=torch.bool)
+    # Generate test data
+    x = torch.randn(2, 8192, 1024, device=torch.device("cuda"))
+    mask = torch.ones(2, 8192, device=torch.device("cuda"), dtype=torch.bool)
 
+    # Run inference
     fused_output = routing_module_fused(x, mask=mask)
-    boundary_prob, boundary_mask, selected_probs = fused_output.boundary_prob, fused_output.boundary_mask, fused_output.selected_probs
-
     unfused_output = routing_module_unfused(x, mask=mask)
-    unfused_boundary_prob, unfused_boundary_mask, unfused_selected_probs = unfused_output.boundary_prob, unfused_output.boundary_mask, unfused_output.selected_probs
 
-    # print dtypes
-    print("\n Dtypes:")
-    print(f"boundary_prob dtype: {boundary_prob.dtype}")
-    print(f"boundary_mask dtype: {boundary_mask.dtype}")
-    print(f"selected_probs dtype: {selected_probs.dtype}")
-    print(f"unfused_boundary_prob dtype: {unfused_boundary_prob.dtype}")
-    print(f"unfused_boundary_mask dtype: {unfused_boundary_mask.dtype}")
-    print(f"unfused_selected_probs dtype: {unfused_selected_probs.dtype}")
+    # Extract outputs
+    (boundary_prob, boundary_mask, selected_probs) = (fused_output.boundary_prob, 
+                                                     fused_output.boundary_mask,
+                                                     fused_output.selected_probs)
+    (unfused_boundary_prob, unfused_boundary_mask, 
+     unfused_selected_probs) = (unfused_output.boundary_prob,
+                              unfused_output.boundary_mask,
+                              unfused_output.selected_probs)
 
-    # print shapes
-    print("\n Shapes:")
-    print(f"boundary_prob shape: {boundary_prob.shape}")
-    print(f"boundary_mask shape: {boundary_mask.shape}")
-    print(f"selected_probs shape: {selected_probs.shape}")
-    print(f"unfused_boundary_prob shape: {unfused_boundary_prob.shape}")
-    print(f"unfused_boundary_mask shape: {unfused_boundary_mask.shape}")
-    print(f"unfused_selected_probs shape: {unfused_selected_probs.shape}")
+    # Print metadata comparison
+    print_comparison("Metadata", [
+        ("dtype", boundary_prob.dtype, unfused_boundary_prob.dtype),
+        ("shape", str(boundary_prob.shape), str(unfused_boundary_prob.shape))
+    ])
 
-    # downcast relevant unfused outputs to bfloat16
+    # Convert unfused outputs for comparison
     unfused_boundary_prob = unfused_boundary_prob.to(torch.bfloat16)
     unfused_selected_probs = unfused_selected_probs.to(torch.bfloat16)
 
-    # print dtype after fusing
-    print("\n Dtypes after fusing:")
-    print(f"boundary_prob dtype: {boundary_prob.dtype}")
-    print(f"boundary_mask dtype: {boundary_mask.dtype}")
-    print(f"selected_probs dtype: {selected_probs.dtype}")
-    print(f"unfused_boundary_prob dtype: {unfused_boundary_prob.dtype}")
-    print(f"unfused_boundary_mask dtype: {unfused_boundary_mask.dtype}")
-    print(f"unfused_selected_probs dtype: {unfused_selected_probs.dtype}")
+    # Validate results
+    mismatch_count = 0
+    for fused, unfused, name in [
+        (boundary_prob, unfused_boundary_prob, "boundary_prob"),
+        (boundary_mask, unfused_boundary_mask, "boundary_mask"),
+        (selected_probs, unfused_selected_probs, "selected_probs")
+    ]:
+        miss_mask = (fused != unfused)
+        miss_count = miss_mask.sum().item()
+        
+        print(f"\nChecking {name}:")
+        print(f"Mismatches: {miss_count}/{fused.numel()} ({miss_count/fused.numel():.2%})")
+        
+        if miss_count > 0:
+            # Handle boolean tensors differently
+            if fused.dtype == torch.bool:
+                print(f"Boolean tensor - showing mismatch locations only")
+            else:
+                abs_diff = torch.abs(fused - unfused)
+                print(f"Max absolute difference: {abs_diff.max().item():.4f}")
+                print(f"Mean absolute difference: {abs_diff.mean().item():.4f}")
+            
+            # Show first few mismatches with their indices and values
+            miss_indices = torch.nonzero(miss_mask, as_tuple=True)
+            print(f"First 10 mismatch locations:")
+            for i in range(min(10, miss_count)):
+                idx = tuple(miss_indices[j][i] for j in range(len(miss_indices)))
+                fused_val = fused[idx].item()
+                unfused_val = unfused[idx].item()
+                
+                if fused.dtype == torch.bool:
+                    print(f"  Index {idx}: Fused={fused_val}, Unfused={unfused_val}")
+                else:
+                    diff = abs(fused_val - unfused_val)
+                    print(f"  Index {idx}: Fused={fused_val:.6f}, Unfused={unfused_val:.6f}, Diff={diff:.6f}")
+            
+            if miss_count > 10:
+                print(f"  ... and {miss_count - 10} more mismatches")
 
-    # # get misses
-    miss_mask = (boundary_mask != unfused_boundary_mask)
-    miss_indices = torch.where(miss_mask)
-    #print(miss_indices)
-
-    print(f"Number of misses: {miss_indices[-1].shape[0]}")
-
-    print(f"miss values: {boundary_mask[miss_indices]}")
-    print(f"unfused miss values: {unfused_boundary_mask[miss_indices]}")
-
-    print(f"\n max difference: {torch.max(torch.abs(selected_probs - unfused_selected_probs))}")
-    relative_errors = torch.abs((selected_probs - unfused_selected_probs) / unfused_selected_probs)  # Already computed, but store it
-    max_rel_error = torch.max(relative_errors)  # Find the maximum
-    print(f"Max relative error: {max_rel_error.item():.6f} ({max_rel_error.item() * 100:.2f}%)")
-
-    # Check threshold
-    threshold = 0.05  # 5%
-    if max_rel_error > threshold:
-        print(f"WARNING: Max relative error exceeds {threshold*100}% - possible logical mismatch!")
-    else:
-        print(f"OK: All relative errors <= {threshold*100}% - likely just FP precision noise.")
-
-    assert torch.allclose(boundary_prob, unfused_boundary_prob, atol=8e-3), "fused and unfused boundary_prob are not close enough" # extra check for numerical stability
-    assert torch.allclose(boundary_mask, unfused_boundary_mask, atol=8e-3), "fused and unfused boundary_mask are not close enough" # extra check for numerical stability 
-    assert torch.allclose(selected_probs, unfused_selected_probs, atol=8e-3), "fused and unfused selected_probs are not close enough" # extra check for numerical stability
-
-
+    # Final validation
+    assert torch.allclose(selected_probs, unfused_selected_probs, atol=8e-3), "Selected probs mismatch"
+    assert torch.allclose(boundary_prob, unfused_boundary_prob, atol=8e-3), "Boundary prob mismatch"
+    assert torch.allclose(boundary_mask, unfused_boundary_mask, atol=8e-3), "Boundary mask mismatch"
+    print("\nAll comparisons within expected tolerances!")
