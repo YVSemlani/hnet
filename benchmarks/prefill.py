@@ -20,6 +20,7 @@ import gc
 from omegaconf import ListConfig
 import numpy as np
 import time
+import itertools
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -93,31 +94,30 @@ def load_from_pretrained(model_path: str, model_config_path: str):
 
     return model
 
-def benchmark(model, input_ids, mask, inference_cache, warmup=3, iters=10):
+def benchmark(model, input_ids, mask, warmup=5, iters=50):
+    batch_size = input_ids.shape[0]
     # run a warmup
     for _ in range(warmup):
-        inference_cache = model.allocate_inference_cache( # inference cache must be reset between forward calls otherwise model treats next call like a step rather than prefill
-            1, input_ids.shape[1] + MAX_TOKENS, dtype=torch.bfloat16
-        )
-        output = model.forward(input_ids, mask=mask, inference_params=inference_cache)
+        with torch.no_grad():
+            output = model.forward(input_ids, mask=mask)
+        del output
+        torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
     total_ms = 0.0
     
     # run the benchmark
     for _ in range(iters):
-        inference_cache = model.allocate_inference_cache( # inference cache must be reset between forward calls otherwise model treats next call like a step rather than prefill
-            1, input_ids.shape[1] + MAX_TOKENS, dtype=torch.bfloat16
-        )
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-        output = model.forward(input_ids, mask=mask, inference_params=inference_cache)
+        with torch.no_grad():
+            output = model.forward(input_ids, mask=mask)
         end_event.record()
         end_event.synchronize()
         total_ms += start_event.elapsed_time(end_event)
-        del inference_cache
         del output
+        torch.cuda.empty_cache()
         gc.collect()
     return total_ms / iters
 
@@ -128,51 +128,80 @@ if __name__ == "__main__":
     model_path = "hf/hnet_2stage_XL.pt"
     model_configs = ["configs/hnet_2stage_XL_fused.json", "configs/hnet_2stage_XL.json"]
     model_names = ["Fused", "Unfused"]
-    MODELS = []
     MAX_TOKENS = 1024
-    results = {}
+    
+    # Create a dictionary to store results by (batch_size, seq_len) key
+    results_dict = {}
+    batch_sizes = [1, 2, 4, 8, 16, 32] # CausalLM support batched inputs when inference params are not provided
+    seq_lens = [8192]
+    num_memory_ops = 2
+    HEAD_DIM = 1024
     for model_idx, model_config in enumerate(model_configs):
         model = load_from_pretrained(model_path, model_config)
-        #print(model)
-        MODELS.append(model)
-        results[model_names[model_idx]] = []
         print(f"Loaded model {model_config}")
-
-
-    # create dummy input with different batch_sizes
-    batch_sizes = [1] # need to get CausalLM to support batched inputs
-    seq_lens = [1024, 2048, 4096, 8192, 16384]
-    inputs = []
-    masks = []
-    inference_caches = []
-    #for batch_size in batch_sizes:
-    for seq_len in seq_lens:
-        print(f"\nCreating dummy input for seq len {seq_len}")
-        input_ids = torch.randint(0, 256, (1, seq_len), device=DEVICE, dtype=torch.int64)
-        mask = torch.ones(1, seq_len, device=DEVICE, dtype=torch.bool)
-        for model_idx, model in enumerate(MODELS):
-            inference_cache = model.allocate_inference_cache(
-                1, input_ids.shape[1] + MAX_TOKENS, dtype=torch.bfloat16
-            )
-            avg_ms = benchmark(model, input_ids, mask, inference_cache)
-            print(f"{model_names[model_idx]} prefill for {seq_len} tokens took {avg_ms:.6f} ms")
-            results[model_names[model_idx]].append(avg_ms)
-        # cleanup
-        del input_ids
-        del mask
-        del inference_cache
+        
+        # Test this model with all configurations
+        for batch_size, seq_len in itertools.product(batch_sizes, seq_lens):
+            print(f"\nCreating dummy input for batch size {batch_size} and seq len {seq_len}")
+            input_ids = torch.randint(0, 256, (batch_size, seq_len), device=DEVICE, dtype=torch.int64)
+            mask = torch.ones(batch_size, seq_len, device=DEVICE, dtype=torch.bool)
+            
+            ms = benchmark(model, input_ids, mask)
+            
+            # Use (batch_size, seq_len) as key to group results
+            key = (batch_size, seq_len)
+            if key not in results_dict:
+                results_dict[key] = {'Batch Size': batch_size, 'Sequence Length': seq_len}
+            tbps = lambda ms: num_memory_ops * input_ids.numel() * input_ids.element_size() * HEAD_DIM * 1e-12 / (ms * 1e-3)
+            results_dict[key][model_names[model_idx]] = tbps(ms)
+            print(f"{model_names[model_idx]} prefill for {batch_size} batch size and {seq_len} tokens took {ms:.6f} ms and achieved {tbps(ms):.6f} TB/s")
+            # cleanup
+            del input_ids
+            del mask
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        # Clean up model
+        del model
         torch.cuda.empty_cache()
         gc.collect()
 
+    # Convert dictionary to list of results
+    results = list(results_dict.values())
+    
     # plot results
-    for model_name, times in results.items():
-        plt.plot(seq_lens, times, label=model_name)
-    plt.xlabel("Sequence Length")
-    plt.ylabel("Average Prefill Time w/ 3 warmup & 10 iters (ms)")
-    plt.legend()
-    plt.savefig(f"{results_dir}/prefill.png")
+    # Convert results list to DataFrame first
+    df = pd.DataFrame(results)
+    
+    # Group results by sequence length and plot separately
+    seq_lens = sorted(df['Sequence Length'].unique())
+    for seq_len in seq_lens:
+        plt.figure(figsize=(10, 6))
+        seq_data = df[df['Sequence Length'] == seq_len].copy()
+        seq_data = seq_data.sort_values('Batch Size')
+        
+        for model_name in model_names:
+            plt.plot(seq_data['Batch Size'], seq_data[model_name], 
+                    marker='o', linewidth=2, markersize=8, label=model_name)
+            
+        plt.title(f"Prefill Time vs Batch Size (SeqLen={seq_len})", fontsize=14)
+        plt.xlabel("Batch Size", fontsize=12)
+        plt.ylabel("Average Prefill Time (ms)", fontsize=12)
+        plt.legend(fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/prefill_len{seq_len}.png", dpi=300, bbox_inches='tight')
+        plt.close()
 
     # save results to csv
-    df = pd.DataFrame(results)
-    df["% Speedup"] = (df["Unfused"] - df["Fused"]) / df["Unfused"] * 100
+    df["% Speedup"] = (df["Fused"] - df["Unfused"]) / df["Unfused"] * 100
+    df.sort_values(by=['Batch Size', 'Sequence Length'], inplace=True)
     df.to_csv(f"{results_dir}/prefill.csv", index=False)
+    
+    # Print summary statistics
+    print("\n=== Benchmark Results Summary ===")
+    print(df.to_string(index=False))
+    
+    # Calculate and print average speedup
+    avg_speedup = df["% Speedup"].mean()
+    print(f"\nAverage speedup: {avg_speedup:.2f}%")

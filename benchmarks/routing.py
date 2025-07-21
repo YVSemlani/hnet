@@ -14,16 +14,8 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 RUN_NAME = "Routing Module Benchmark"
 
-def run_dc(x, mask, routing_module):
-    return routing_module(x, mask=mask)
-
-def run_fused_dc(x, q_proj, k_proj):
-    Q = q_proj(x[:, :-1])
-    K = k_proj(x[:, 1:])
-
-    p, b = fused_dc(Q, K)
-
-    return p, b
+def ms_to_tb_s(x, ms):
+    return x.shape[0] * x.shape[1] * x.shape[2] * 4 * 1000 / ms / 1e12
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -36,7 +28,7 @@ def run_fused_dc(x, q_proj, k_proj):
             "Unfused",
         ],  # label name for the lines
         styles=[('blue', '-'), ('green', '-')],  # line styles
-        ylabel="time (ms)",  # label name for the y-axis
+        ylabel="Throughput (TB/s)",  # label name for the y-axis
         plot_name=RUN_NAME,  # name for the plot. Used also as a file name for saving the plot.
         args={'SEQ_LEN': 8192, 'HEAD_DIM': 1024},  # values for function arguments not in `x_names` and `y_name`
     ))
@@ -58,10 +50,13 @@ def benchmark(BATCH_SIZE, SEQ_LEN, HEAD_DIM, provider):
         ms = triton.testing.do_bench(lambda: routing_module_fused(x, mask=mask), warmup=10)
         #print(f"Fused DC: {ms}")
 
+    num_memory_ops = 2
+    tbps = lambda ms: num_memory_ops * x.numel() * x.element_size() * 1e-12 / (ms * 1e-3)
+
     # clear cache
     torch.cuda.empty_cache()
     gc.collect()
-    return ms
+    return tbps(ms)
 
 if __name__ == "__main__":
     save_path = "reports/routing"
@@ -69,5 +64,5 @@ if __name__ == "__main__":
 
     # add a percent speedup to the saved csv
     df = pd.read_csv(f"{save_path}/{RUN_NAME}.csv")
-    df["% Speedup"] = (df["Unfused"] - df["Fused"]) / df["Unfused"] * 100
+    df["% Speedup"] = (df["Fused"] - df["Unfused"]) / df["Unfused"] * 100
     df.to_csv(f"{save_path}/{RUN_NAME}.csv", index=False)

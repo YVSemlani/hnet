@@ -88,10 +88,9 @@ class RoutingModule(nn.Module):
             Q, K = self.q_proj_layer(hidden_states[:, :-1]), self.k_proj_layer(hidden_states[:, 1:])
             boundary_prob, boundary_mask, selected_probs = fused_dc(Q, K)
 
-            # print shapes
-            print(boundary_prob.shape)
-            print(boundary_mask.shape)
-            print(selected_probs.shape)
+            #print(f"fused_dc boundary_prob shape: {boundary_prob.shape}")
+            #print(f"fused_dc boundary_mask shape: {boundary_mask.shape}")
+            #print(f"fused_dc selected_probs shape: {selected_probs.shape}")
 
         else:
             cos_sim = torch.einsum(
