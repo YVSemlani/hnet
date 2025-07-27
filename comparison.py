@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from hnet.models.mixer_seq import HNetForCausalLM # for comparison purposes
 from hnet_simple import HNetLM, AttnConfig, SSMConfig, HNetConfig
 
+import time
+
 
 @dataclass(frozen=True)
 class ByteTokenizer:
@@ -38,14 +40,16 @@ def load_models(model_path: str, config_path: str, *, device: str='cuda'):
 
     with torch.device(device):
         model_old = HNetForCausalLM(c, device=device, dtype=torch.bfloat16).eval()
-        model_new = HNetLM(c).bfloat16().eval()
+        model_fused = HNetLM(c, fused=True).bfloat16().eval()
+        model_native = HNetLM(c, fused=False).bfloat16().eval()
 
     with torch.serialization.safe_globals([ListConfig]):
         state_dict = torch.load(model_path, map_location=device, weights_only=False)
         model_old.load_state_dict(state_dict)
-        model_new.load_state_dict(state_dict)
+        model_fused.load_state_dict(state_dict)
+        model_native.load_state_dict(state_dict)
 
-    return model_old, model_new
+    return model_old, model_fused, model_native
 
 
 ###
@@ -158,17 +162,34 @@ def compare_numerics(m_old, m_new, max_tokens):
     print(t_new)
     print(' decode diff:', t_old-t_new)
 
-def compare_generate(m_old, m_new, tokenizer, *, p='hello world'):
+def compare_generate(models, tokenizer, *, p='hello world', model_names=['old', 'new']):
     def fullgen(*a,**k): return [t[0] for t in generate(*a,max_tokens=50,**k)]
-    # compare generation
-    y_old = fullgen(m_old, p, temperature=0.001, top_p=0.001)
-    y_new = fullgen(m_new, p, temperature=0.001, top_p=0.001)
-    assert y_old == y_new
+
+    assert len(models) == len(model_names), f"len(models) != len(model_names): {len(models)} != {len(model_names)}"
+    RUNS = 50
+    for model, model_name in zip(models, model_names):
+        times = []
+        for _ in range(RUNS):
+            # added timing code
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+            start_time = time.perf_counter()
+            # compare generation
+            y = fullgen(model, p, temperature=0.001, top_p=0.001)
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            times.append(end_time - start_time)
+
+        print(f"{model_name} model average time: {sum(times) / RUNS} seconds")
 
     # compare random consistency
-    torch.manual_seed(0); y_old = fullgen(m_old, p)
-    torch.manual_seed(0); y_new = fullgen(m_new, p)
-    assert y_old == y_new
+    torch.manual_seed(0); y_old = fullgen(models[0], p)
+    torch.manual_seed(0); y_fused = fullgen(models[1], p)
+    torch.manual_seed(0); y_native = fullgen(models[2], p)
+    assert y_old == y_fused == y_native, f"y_old != y_fused != y_native: {y_old} != {y_fused} != {y_native}"
     print('generation:', repr(tokenizer.decode(bytearray(torch.cat(y_old)[:,-1]))))
 
 
@@ -183,15 +204,24 @@ def main(
 ):
     tokenizer = ByteTokenizer()
     print("Loading model...")
-    m_old, m_new = load_models(model, config)
+    m_old, m_fused, m_native = load_models(model, config)
 
     if validation:
-        compare_numerics(m_old, m_new, max_tokens)
-        compare_generate(m_old, m_new, tokenizer)
+        print("Running numerical comparison...")
+        print("Old vs Fused")
+        compare_numerics(m_old, m_fused, max_tokens) # old vs fused
+        print("Old vs Native")
+        compare_numerics(m_old, m_native, max_tokens) # old vs native
+        #print("Fused vs Native")
+        #compare_numerics(m_fused, m_native, max_tokens) # fused vs native
+
+        # run comprehensive comparison
+        print("Running timing comparison...")
+        compare_generate([m_old, m_fused, m_native], tokenizer, model_names=['old', 'fused', 'native']) # old vs fused  
         return
 
     print("Warming up...")
-    list(generate(m_new, 'hello world!!!', max_tokens, temp, top_p))
+    list(generate(m_fused, 'hello world!!!', max_tokens, temp, top_p))
 
     while True:
         prompt = input("\nPrompt: ").strip()
@@ -203,7 +233,7 @@ def main(
 
         # alternate between white-on-black and black-on-white (not very accurate)
         for i,chunk in enumerate(yield_utf8_chunks(
-            generate(m_new, prompt, max_tokens, temp, top_p)
+            generate(m_fused, prompt, max_tokens, temp, top_p)
         )):
             s = '\n'.join(
                 colored(c, 'white' if i%2 else 'black', 'on_black' if i%2 else 'on_white')

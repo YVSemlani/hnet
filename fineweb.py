@@ -73,6 +73,7 @@ def seqlen_sorted_fineweb(rank: int, wsize: int, msl: int=1<<15, bos: bytes=b'\x
 
 # There are no checks here for partial termination. Nuke OUTPUT_DIR if you need to retry.
 if __name__ == '__main__':
+    OUTPUT_DIR.mkdir(exist_ok=True)
     if not any(OUTPUT_DIR.iterdir()): dump_fineweb_to_disk()
     # show first sample && show speed for 1000 batches
     for i,ls in enumerate(tqdm(seqlen_sorted_fineweb(1,8))):

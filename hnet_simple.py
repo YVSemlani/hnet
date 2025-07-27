@@ -20,6 +20,9 @@ from hnet.modules.isotropic import IsotropicInferenceParams
 from hnet.models.config_hnet import AttnConfig, SSMConfig, HNetConfig
 from hnet.models.hnet import RoutingModuleState, DeChunkState, HNetState
 
+# fused chunking
+from hnet.modules.ops.fused_dc import fused_dc
+
 # Well-studied/familiar architectures
 from hnet.modules.block import CausalMHA, Mamba2Wrapper, SwiGLU, RMSNorm
 
@@ -122,11 +125,13 @@ class Isotropic(nn.Module):
 ### ################
 
 class RoutingModule(nn.Module):
-    def __init__(self, d):
+    def __init__(self, d, fused: bool = False):
         super().__init__()
         self.d = d
         self.q_proj_layer = Lin(d,d)
         self.k_proj_layer = Lin(d,d)
+        self.fused = fused
+
     def allocate_inference_cache(self):
         return RoutingModuleState(
             has_seen_tokens=torch.zeros(1, dtype=torch.bool),
@@ -136,10 +141,14 @@ class RoutingModule(nn.Module):
         inference_params.has_seen_tokens[:] = 1
         inference_params.last_hidden_state.copy_(x[:,-1])
         q,k = self.q_proj_layer(x[:, :-1]), self.k_proj_layer(x[:, 1:])
-        cos_sim = F.cosine_similarity(q,k,dim=-1) # [-1,1]
-        p = (.5-cos_sim/2).clamp(.0,1.) # rescale to [0,1]
-        p = F.pad(p, (1,0), 'constant', 1.) # insert p_0 = 1.0
-        b = p >= .5
+        if not self.fused:
+            cos_sim = F.cosine_similarity(q,k,dim=-1) # [-1,1]
+            p = (.5-cos_sim/2).clamp(.0,1.) # rescale to [0,1]
+            p = F.pad(p, (1,0), 'constant', 1.) # insert p_0 = 1.0
+            b = p >= .5
+        else:
+            # fused approach
+            p, b = fused_dc(q, k)
         return SequenceRouting(p, b, p.masked_select(b))
 
     def step(self, x, inference_params):
@@ -209,7 +218,7 @@ class DeChunkLayer(nn.Module):
 ### #################
 
 class HNet(nn.Module):
-    def __init__(self, c: HNetConfig, stage_idx: int):
+    def __init__(self, c: HNetConfig, stage_idx: int, fused: bool = False):
         super().__init__()
         self.stage_idx = stage_idx
         self.d = c.d_model[stage_idx]
@@ -227,7 +236,7 @@ class HNet(nn.Module):
             self.main_network = HNet(c, stage_idx+1)
             self.decoder = Isotropic(c, arch_layout[2], stage_idx=stage_idx)
 
-            self.routing_module = RoutingModule(self.d)
+            self.routing_module = RoutingModule(self.d, fused=fused)
             self.dechunk_layer = DeChunkLayer(self.d)
             self.residual_proj = nn.Linear(self.d,self.d) # NOTE: even though this is fp32 in the source code, I allow this to become lower precision.
 
@@ -292,11 +301,11 @@ class HNet(nn.Module):
         return self.decoder.step(x, inference_params.decoder_state)[...,:d_orig]
 
 class HNetLM(nn.Module):
-    def __init__(self, c: HNetConfig):
+    def __init__(self, c: HNetConfig, fused: bool = False):
         super().__init__()
         self.c, v, d = c, c.vocab_size, c.d_model[0]
         self.embeddings = nn.Embedding(v,d)
-        self.backbone = HNet(c, stage_idx=0)
+        self.backbone = HNet(c, stage_idx=0, fused=fused)
         self.lm_head = Lin(d,v)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype):
