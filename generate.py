@@ -12,71 +12,8 @@ from hnet.models.config_hnet import (
     HNetConfig,
 )
 
-
-class ByteTokenizer:
-    def __init__(self):
-        self.vocab_size = 256
-        self.bos_idx = 254
-        self.eos_idx = 255
-        self.dtype = np.uint8
-
-    def encode(self, seqs, add_bos=False, add_eos=False, **kwargs):
-        total_outputs = []
-        for text in seqs:
-            text_byte = text.encode("utf-8")
-
-            if add_bos:
-                text_byte = bytes([self.bos_idx]) + text_byte
-            if add_eos:
-                text_byte = text_byte + bytes([self.eos_idx])
-            text_byte = bytearray(text_byte)
-            text_byte_ids = np.array(text_byte, dtype=self.dtype)
-
-            total_outputs.append({"input_ids": text_byte_ids})
-
-        return total_outputs
-
-    def decode(self, tokens, **kwargs):
-        if isinstance(tokens, np.ndarray):
-            tokens = tokens.tolist()
-        return bytearray(tokens).decode("utf-8", **kwargs)
-
-
-def load_from_pretrained(model_path: str, model_config_path: str):
-    """Load model from pretrained checkpoint.
-
-    Args:
-        model_path: Path to the model checkpoint (.pt file)
-        model_config_path: Path to the model configuration (.json file)
-
-    Returns:
-        Loaded HNetForCausalLM model
-    """
-    # Load configuration
-    with open(model_config_path, "r") as f:
-        config = json.load(f)
-
-    # Create config objects
-    attn_cfg = AttnConfig(**config.pop("attn_cfg"))
-    ssm_cfg = SSMConfig(**config.pop("ssm_cfg"))
-    hnet_cfg = HNetConfig(**config, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
-
-    # Create model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
-    model.eval()
-
-    # Load checkpoint
-    major, minor = map(int, torch.__version__.split('.')[:2])
-    if (major, minor) >= (2, 6):
-        with torch.serialization.safe_globals([ListConfig]):
-            state_dict = torch.load(model_path, map_location=device, weights_only=False)
-    else:
-        state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
-
-    return model
-
+from hnet.utils.tokenizers import ByteTokenizer
+from hnet.utils.loaders import load_from_pretrained
 
 def generate(
     model,
@@ -106,19 +43,26 @@ def generate(
         encoded["input_ids"], dtype=torch.long, device=device
     ).unsqueeze(0)
 
-    print(f"Input IDs shape: {input_ids.shape}")
-    print(f"Input IDs: {input_ids}")
-
+    # Allocate inference cache
     inference_cache = model.allocate_inference_cache(
         1, input_ids.shape[1] + max_tokens, dtype=torch.bfloat16
     )
 
+    # Forward pass
     with torch.inference_mode():
         mask = torch.ones(input_ids.shape, device=device, dtype=torch.bool)
         output = model.forward(input_ids, mask=mask, inference_params=inference_cache)
 
+    # set initial boundary indicator
+    #print("PREFILLED BOUNDARY INDICATORS")
+    #print(f"output.bpred_output: {output.bpred_output}")
+    boundary_indicators = [stage.boundary_mask[:, -1] for stage in output.bpred_output]
+    #print(f"boundary_indicators: {boundary_indicators}")
+
+    # Generate tokens
     logits = output.logits[0, -1, :] / temperature
 
+    # Autoregressive generation
     for _ in range(max_tokens):
         # Apply top-p sampling
         if top_p < 1.0:
@@ -142,14 +86,18 @@ def generate(
             break
 
         current_token = next_token.unsqueeze(0)
-        yield current_token
+        yield current_token, boundary_indicators # yield current token and status as a boundary token
 
         with torch.inference_mode():
             output = model.step(current_token, inference_cache)
 
+        # update boundary indicator
+        #print(f"output.bpred_output: {output.bpred_output}")
+        boundary_indicators = [stage.boundary_mask.item() for stage in output.bpred_output]
+        #print(f"boundary_indicators: {boundary_indicators}")
+
         # Get logits and apply temperature
         logits = output.logits[0, -1, :] / temperature
-
 
 def main():
     parser = argparse.ArgumentParser(description="Generate text from an H-Net model")
@@ -196,6 +144,7 @@ def main():
     tokenizer = ByteTokenizer()
 
     while True:
+        print("\n")
         prompt = input("\nPrompt: ").strip()
 
         if not prompt:
@@ -205,11 +154,12 @@ def main():
             f"\nGenerating (max_tokens={args.max_tokens}, temperature={args.temperature}, top_p={args.top_p})"
         )
 
-        print(f"\033[92m{prompt}\033[0m", end="")
+        print(f"\033[92m{prompt}\033[0m\n", end="")
         token_count = 0
         buf = []
+        boundary_buf = []
 
-        for token in generate(
+        for token, boundary_indicator in generate(
             model,
             prompt,
             max_tokens=args.max_tokens,
@@ -218,6 +168,7 @@ def main():
         ):
             buf.append(token)
             token_count += 1
+            boundary_buf.append(boundary_indicator[0])
 
             decoded = None
             res = None
@@ -229,8 +180,23 @@ def main():
                     pass
 
             if res is not None:
-                print(res, end="", flush=True)
+                # Background colouring legend (foreground;text / background):
+                #   Bright Red BG  (\033[97;101m) -> all tokens are boundary tokens
+                #   Bright Blue BG (\033[97;104m) -> majority tokens are boundary tokens
+                #   Bright White BG(\033[30;107m) -> no tokens are boundary tokens
+                #   Bright Yellow BG(\033[30;103m) -> majority tokens are not boundary tokens
+                #   Green FG (\033[92m)  -> Prompt text (printed above)
+                if False not in boundary_buf[:decoded]: # all byte level tokens are boundary tokens
+                    print(f"\033[97;101m{res}\033[0m", end="", flush=True)
+                elif True not in boundary_buf[:decoded]: # all byte level tokens are not boundary tokens
+                    print(f"\033[30;107m{res}\033[0m", end="", flush=True)
+                elif sum(boundary_buf[:decoded]) > len(boundary_buf[:decoded]) / 2: # most byte level tokens are boundary tokens
+                    print(f"\033[97;104m{res}\033[0m", end="", flush=True)
+                else: # most byte level tokens are not boundary tokens
+                    print(f"\033[30;103m{res}\033[0m", end="", flush=True)
+                #print(res, end="", flush=True)
                 buf = buf[decoded:]
+                boundary_buf = boundary_buf[decoded:]
 
 
 if __name__ == "__main__":
