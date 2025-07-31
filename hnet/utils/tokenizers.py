@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 class ByteTokenizer:
     def __init__(self):
@@ -27,3 +28,11 @@ class ByteTokenizer:
         if isinstance(tokens, np.ndarray):
             tokens = tokens.tolist()
         return bytearray(tokens).decode("utf-8", **kwargs)
+
+
+if __name__ == "__main__":
+    tokenizer = ByteTokenizer()
+    test = tokenizer.encode(["test"], add_bos=True)
+    print(test)
+    ids = np.array([116])
+    print(tokenizer.decode(ids))

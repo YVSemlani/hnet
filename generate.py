@@ -143,6 +143,17 @@ def main():
 
     tokenizer = ByteTokenizer()
 
+    print("Color legend:")
+    print("  \033[101mRed background\033[0m: Passed stage 1 but not stage 2 (all boundary)")
+    print("  \033[104mBlue background\033[0m: Passed stage 1 but not stage 2 (most boundary)")
+    print("  \033[103mYellow background\033[0m: Passed stage 1 but not stage 2 (most non-boundary)")
+    print("  \033[100mGray background\033[0m: Passed stage 1 but not stage 2 (no boundary)")
+    print("  \033[1;91mBold Red\033[0m: All tokens are boundary tokens (stage 1)")
+    print("  \033[94mBlue\033[0m: Most tokens are boundary tokens (stage 1)")
+    print("  \033[93mYellow\033[0m: Most tokens are not boundary tokens (stage 1)")
+    print("  Normal: No boundary tokens (stage 1)")
+    print()
+
     while True:
         print("\n")
         prompt = input("\nPrompt: ").strip()
@@ -168,7 +179,7 @@ def main():
         ):
             buf.append(token)
             token_count += 1
-            boundary_buf.append(boundary_indicator[0])
+            boundary_buf.append(boundary_indicator)
 
             decoded = None
             res = None
@@ -180,21 +191,61 @@ def main():
                     pass
 
             if res is not None:
-                # Background colouring legend (foreground;text / background):
-                #   Bright Red BG  (\033[97;101m) -> all tokens are boundary tokens
-                #   Bright Blue BG (\033[97;104m) -> majority tokens are boundary tokens
-                #   Bright White BG(\033[30;107m) -> no tokens are boundary tokens
-                #   Bright Yellow BG(\033[30;103m) -> majority tokens are not boundary tokens
-                #   Green FG (\033[92m)  -> Prompt text (printed above)
-                if False not in boundary_buf[:decoded]: # all byte level tokens are boundary tokens
-                    print(f"\033[97;101m{res}\033[0m", end="", flush=True)
-                elif True not in boundary_buf[:decoded]: # all byte level tokens are not boundary tokens
-                    print(f"\033[30;107m{res}\033[0m", end="", flush=True)
-                elif sum(boundary_buf[:decoded]) > len(boundary_buf[:decoded]) / 2: # most byte level tokens are boundary tokens
-                    print(f"\033[97;104m{res}\033[0m", end="", flush=True)
-                else: # most byte level tokens are not boundary tokens
-                    print(f"\033[30;103m{res}\033[0m", end="", flush=True)
-                #print(res, end="", flush=True)
+                # Two-stage colouring (stage-0 foreground, stage-1 background) –
+                # logic mirrors hnet.gsm8k.boundary_print
+                stage_info_list = boundary_buf[:decoded]
+
+                def classify(vals):
+                    if not vals:
+                        return "none"
+                    true_count = sum(vals)
+                    total = len(vals)
+                    if true_count == total:
+                        return "all"
+                    elif true_count == 0:
+                        return "none"
+                    elif true_count > total / 2:
+                        return "most"
+                    else:
+                        return "most_not"
+
+                # Stage-1 classification (foreground colours)
+                stage1_vals = [info[0] if len(info) > 0 and info[0] is not None else False for info in stage_info_list]
+                class1 = classify(stage1_vals)
+
+                # Stage-2 classification (background colours) – only for tokens that were boundary in stage-1
+                stage2_vals = []
+                if any(len(info) > 1 for info in stage_info_list):
+                    for info in stage_info_list:
+                        s1 = info[0] if len(info) > 0 and info[0] is not None else False
+                        if s1:
+                            s2 = info[1] if len(info) > 1 and info[1] is not None else False
+                            stage2_vals.append(s2)
+
+                fg_map = {
+                    "all": "\033[1;91m",
+                    "most": "\033[94m",
+                    "most_not": "\033[93m",
+                    "none": "",
+                }
+                bg_map = {
+                    "all": "\033[101m",
+                    "most": "\033[104m",
+                    "most_not": "\033[103m",
+                    "none": "\033[100m",
+                }
+
+                if stage2_vals:
+                    class2 = classify(stage2_vals)
+                    color_code = bg_map[class2]
+                else:
+                    color_code = fg_map[class1]
+
+                if color_code:
+                    print(f"{color_code}{res}\033[0m", end="", flush=True)
+                else:
+                    print(f"{res}", end="", flush=True)
+
                 buf = buf[decoded:]
                 boundary_buf = boundary_buf[decoded:]
 
